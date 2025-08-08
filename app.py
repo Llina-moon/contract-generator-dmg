@@ -1,5 +1,6 @@
 from flask import Flask, render_template, request, send_file, redirect, url_for, flash, abort
 from docx import Document
+from docx.shared import RGBColor  # для установки чёрного цвета
 import os, re, io
 from datetime import datetime
 from zipfile import ZipFile
@@ -13,12 +14,14 @@ os.makedirs(GENERATED_DIR, exist_ok=True)
 app = Flask(__name__)
 app.secret_key = os.environ.get("SECRET_KEY", "dev-secret")
 
+# Ищем всё вида { ... }
 PLACEHOLDER_RE = re.compile(r"\{[^{}]+\}")
 
 def list_templates():
     return sorted([f for f in os.listdir(TEMPLATE_DIR) if f.lower().endswith(ALLOWED_SUFFIX)])
 
 def extract_placeholders(docx_paths):
+    """Собираем уникальные плейсхолдеры из тела, таблиц и колонтитулов."""
     found = set()
     for path in docx_paths:
         doc = Document(path)
@@ -47,34 +50,104 @@ def extract_placeholders(docx_paths):
                     found.update(PLACEHOLDER_RE.findall(full))
     return sorted(found)
 
-def replace_text_in_paragraph(paragraph, mapping):
-    # устойчиво заменяет плейсхолдеры даже если они порезаны на runs
-    full_text = "".join(run.text for run in paragraph.runs) or paragraph.text
-    if not full_text:
+def replace_placeholders_preserve_runs(paragraph, mapping):
+    """
+    Бережная замена: сохраняем исходные runs (а значит — шрифт, размер, жирность и т.п.).
+    Меняем ТОЛЬКО текст плейсхолдера на value и делаем его чёрным.
+    Если плейсхолдер пересекает несколько runs, значение вставляем в начальный run,
+    конечный run обрезаем, промежуточные очищаем — верстка абзаца не «пересобирается».
+    """
+    if not paragraph.runs:
         return
-    for k, v in mapping.items():
-        full_text = full_text.replace(k, v)
-    # очистка runs и добавление одной новой строки
-    for _ in range(len(paragraph.runs)):
-        r = paragraph.runs[0]
-        r.clear()
-        r.text = ""
-        r.element.getparent().remove(r.element)
-    paragraph.add_run(full_text)
+
+    run_texts = [r.text or "" for r in paragraph.runs]
+    full = "".join(run_texts)
+    if not full:
+        return
+
+    matches = list(PLACEHOLDER_RE.finditer(full))
+    if not matches:
+        return
+
+    # Префиксные суммы длин для маппинга глобального индекса к (run_idx, offset)
+    lengths = [len(t) for t in run_texts]
+    cumul = []
+    s = 0
+    for L in lengths:
+        cumul.append(s)
+        s += L
+
+    def locate(pos: int):
+        """Глобальный индекс -> (run_idx, offset_in_run)"""
+        i = 0
+        # ищем последний cumul[i] <= pos
+        while i + 1 < len(cumul) and cumul[i + 1] <= pos:
+            i += 1
+        return i, pos - cumul[i]
+
+    # Идём с конца, чтобы индексы не съезжали
+    for m in reversed(matches):
+        ph_text = m.group(0)
+        if ph_text not in mapping:
+            continue
+        value = mapping[ph_text]
+
+        start, end = m.start(), m.end()
+        si, so = locate(start)
+        ei, eo = locate(end - 1)  # последний символ плейсхолдера
+
+        if si == ei:
+            # Плейсхолдер целиком в одном run
+            r = paragraph.runs[si]
+            t = r.text or ""
+            before = t[:so]
+            after = t[eo + 1:]
+            r.text = before + value + after
+            try:
+                r.font.color.rgb = RGBColor(0, 0, 0)
+            except Exception:
+                pass
+        else:
+            # Плейсхолдер пересекает несколько run'ов
+            r_start = paragraph.runs[si]
+            r_end   = paragraph.runs[ei]
+
+            t_start = r_start.text or ""
+            t_end   = r_end.text or ""
+
+            before = t_start[:so]
+            after  = t_end[eo + 1:]
+
+            # Вставляем значение в начальный run, сохраняется его шрифт/размер
+            r_start.text = before + value
+            try:
+                r_start.font.color.rgb = RGBColor(0, 0, 0)
+            except Exception:
+                pass
+
+            # Конечный run — оставляем хвост после плейсхолдера
+            r_end.text = after
+
+            # Промежуточные run'ы чистим
+            for idx in range(si + 1, ei):
+                paragraph.runs[idx].text = ""
 
 def replace_in_doc(doc, mapping):
+    # основной текст
     for p in doc.paragraphs:
-        replace_text_in_paragraph(p, mapping)
+        replace_placeholders_preserve_runs(p, mapping)
+    # таблицы
     for t in doc.tables:
         for row in t.rows:
             for cell in row.cells:
                 for p in cell.paragraphs:
-                    replace_text_in_paragraph(p, mapping)
+                    replace_placeholders_preserve_runs(p, mapping)
+    # колонтитулы
     for section in doc.sections:
         for p in section.header.paragraphs:
-            replace_text_in_paragraph(p, mapping)
+            replace_placeholders_preserve_runs(p, mapping)
         for p in section.footer.paragraphs:
-            replace_text_in_paragraph(p, mapping)
+            replace_placeholders_preserve_runs(p, mapping)
 
 @app.route("/")
 def index():
