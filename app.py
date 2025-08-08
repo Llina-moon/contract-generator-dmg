@@ -1,6 +1,6 @@
 from flask import Flask, render_template, request, send_file, redirect, url_for, flash, abort
 from docx import Document
-from docx.shared import RGBColor  # для установки чёрного цвета
+from docx.shared import RGBColor
 import os, re, io
 from datetime import datetime
 from zipfile import ZipFile
@@ -14,14 +14,12 @@ os.makedirs(GENERATED_DIR, exist_ok=True)
 app = Flask(__name__)
 app.secret_key = os.environ.get("SECRET_KEY", "dev-secret")
 
-# Ищем всё вида { ... }
 PLACEHOLDER_RE = re.compile(r"\{[^{}]+\}")
 
 def list_templates():
     return sorted([f for f in os.listdir(TEMPLATE_DIR) if f.lower().endswith(ALLOWED_SUFFIX)])
 
 def extract_placeholders(docx_paths):
-    """Собираем уникальные плейсхолдеры из тела, таблиц и колонтитулов."""
     found = set()
     for path in docx_paths:
         doc = Document(path)
@@ -51,12 +49,7 @@ def extract_placeholders(docx_paths):
     return sorted(found)
 
 def replace_placeholders_preserve_runs(paragraph, mapping):
-    """
-    Бережная замена: сохраняем исходные runs (а значит — шрифт, размер, жирность и т.п.).
-    Меняем ТОЛЬКО текст плейсхолдера на value и делаем его чёрным.
-    Если плейсхолдер пересекает несколько runs, значение вставляем в начальный run,
-    конечный run обрезаем, промежуточные очищаем — верстка абзаца не «пересобирается».
-    """
+    """Сохраняем стили/размеры: меняем только текст плейсхолдера на value и красим в чёрный."""
     if not paragraph.runs:
         return
 
@@ -69,7 +62,6 @@ def replace_placeholders_preserve_runs(paragraph, mapping):
     if not matches:
         return
 
-    # Префиксные суммы длин для маппинга глобального индекса к (run_idx, offset)
     lengths = [len(t) for t in run_texts]
     cumul = []
     s = 0
@@ -78,14 +70,11 @@ def replace_placeholders_preserve_runs(paragraph, mapping):
         s += L
 
     def locate(pos: int):
-        """Глобальный индекс -> (run_idx, offset_in_run)"""
         i = 0
-        # ищем последний cumul[i] <= pos
         while i + 1 < len(cumul) and cumul[i + 1] <= pos:
             i += 1
         return i, pos - cumul[i]
 
-    # Идём с конца, чтобы индексы не съезжали
     for m in reversed(matches):
         ph_text = m.group(0)
         if ph_text not in mapping:
@@ -94,10 +83,9 @@ def replace_placeholders_preserve_runs(paragraph, mapping):
 
         start, end = m.start(), m.end()
         si, so = locate(start)
-        ei, eo = locate(end - 1)  # последний символ плейсхолдера
+        ei, eo = locate(end - 1)
 
         if si == ei:
-            # Плейсхолдер целиком в одном run
             r = paragraph.runs[si]
             t = r.text or ""
             before = t[:so]
@@ -108,7 +96,6 @@ def replace_placeholders_preserve_runs(paragraph, mapping):
             except Exception:
                 pass
         else:
-            # Плейсхолдер пересекает несколько run'ов
             r_start = paragraph.runs[si]
             r_end   = paragraph.runs[ei]
 
@@ -118,31 +105,25 @@ def replace_placeholders_preserve_runs(paragraph, mapping):
             before = t_start[:so]
             after  = t_end[eo + 1:]
 
-            # Вставляем значение в начальный run, сохраняется его шрифт/размер
             r_start.text = before + value
             try:
                 r_start.font.color.rgb = RGBColor(0, 0, 0)
             except Exception:
                 pass
 
-            # Конечный run — оставляем хвост после плейсхолдера
             r_end.text = after
 
-            # Промежуточные run'ы чистим
             for idx in range(si + 1, ei):
                 paragraph.runs[idx].text = ""
 
 def replace_in_doc(doc, mapping):
-    # основной текст
     for p in doc.paragraphs:
         replace_placeholders_preserve_runs(p, mapping)
-    # таблицы
     for t in doc.tables:
         for row in t.rows:
             for cell in row.cells:
                 for p in cell.paragraphs:
                     replace_placeholders_preserve_runs(p, mapping)
-    # колонтитулы
     for section in doc.sections:
         for p in section.header.paragraphs:
             replace_placeholders_preserve_runs(p, mapping)
@@ -178,12 +159,21 @@ def generate():
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     out_files = []
 
+    # имя на основе {ФИО}
+    fio_value = (mapping.get("{ФИО}", "") or "").strip()
+    if not fio_value:
+        fio_value = "БезФИО"
+    # убираем запрещённые для файлов символы
+    safe_fio = re.sub(r'[\\/*?:"<>|]', "", fio_value)
+
     for name in selected:
         path = os.path.join(TEMPLATE_DIR, name)
         doc = Document(path)
         replace_in_doc(doc, mapping)
-        base = os.path.splitext(name)[0]
-        out_name = f"{base}__{stamp}.docx"
+
+        base = os.path.splitext(name)[0]  # напр. "договор" или "приложение"
+        out_name = f"{safe_fio} {base}.docx"
+
         out_path = os.path.join(GENERATED_DIR, out_name)
         doc.save(out_path)
         out_files.append(out_path)
@@ -193,7 +183,9 @@ def generate():
         for fp in out_files:
             z.write(fp, arcname=os.path.basename(fp))
     mem.seek(0)
-    return send_file(mem, as_attachment=True, download_name=f"contracts_{stamp}.zip")
+    # Можно и ZIP назвать по ФИО:
+    zip_name = f"{safe_fio}.zip" if safe_fio else f"contracts_{stamp}.zip"
+    return send_file(mem, as_attachment=True, download_name=zip_name)
 
 @app.route("/downloads")
 def downloads():
